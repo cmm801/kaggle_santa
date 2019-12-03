@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import datetime
 from collections import deque
+import matplotlib.pyplot as plt
 
 N_DAYS = 100
 N_CHOICES = 10
@@ -9,6 +10,7 @@ N_FAMILIES = 5000
 MAX_FAMILY_SIZE = 8
 MAX_OCCUPANCY = 300
 MIN_OCCUPANCY = 125
+MAX_PREFERENCE_COST = 3972
 
 class AssignmentHelper():
 
@@ -19,6 +21,10 @@ class AssignmentHelper():
         self.preferences = input_data.drop(['n_people'], axis=1).to_numpy() - 1        
         self.family_sizes = input_data['n_people'].to_numpy()
  
+        # Initialize a matrix for preference costs (# Families x # Days)
+        # Only will be populated if and when get_preference_cost_matrix is called
+        self.pref_cost_matrix = None
+    
         # Calculate preference costs according to the family size
         # Each row index corresponds to the size of the family (i.e., row index 4 is a 4-person family)        
         self.pref_cost_lookup = np.ones( (MAX_FAMILY_SIZE + 1, N_CHOICES + 1), dtype=np.int32 )
@@ -61,6 +67,12 @@ class AssignmentHelper():
         for family_id, assigned_day in enumerate(assignment):
             occupancy[assigned_day] += self.family_sizes[family_id]
         return occupancy    
+                
+    def calc_occupancy_prob(self, assignment_prob):
+        """Calculate the occupancy from a probabilistic assignment and the family sizes.
+        """
+        occupancy = ( assignment_prob * helper.family_sizes[:,np.newaxis] ).sum(axis=0)        
+        return occupancy        
     
     def calc_preference_cost(self, assignment):
         """Calculates the preference cost of a complete assignment.
@@ -72,7 +84,37 @@ class AssignmentHelper():
 
         # Get the vector of costs according to the assignment rank
         return self.pref_cost_lookup[ self.family_sizes, assignment_rank ]
-
+    
+    def get_preference_penalty(self, assignment_prob, idx=None):
+        """Get the penalty size to be assessed on assignments when they violate constraints.
+        """
+        if idx is None:
+            return np.max( self.pref_cost_matrix, axis=1, keepdims=True)
+        else:
+            return self.pref_cost_matrix[idx,:].max()
+        
+    def calc_preference_cost_prob(self, assignment_prob, idx=None):
+        """Calculates the preference cost based on probabilities of assignment. 
+        Adds a penalty if the individual preferences do not sum to one, or if they are outside of [0,1].
+        """
+        A = assignment_prob        
+        if idx is None:
+            assert A.shape[0] == N_FAMILIES, 'Dimensional mismatch.'
+            PC = A * self.get_preference_cost_matrix() 
+        else:
+            assert A.shape[0] == 1, 'Dimensional mismatch.'            
+            PC = A * self.get_preference_cost_matrix()[idx,:]
+            
+        pref_penalty = self.get_preference_penalty(A, idx=idx)
+    
+        # Add penalty for assignment being outside of the interval [0,1]
+        PC += np.maximum(0, -A) * pref_penalty
+        PC += np.maximum(0, A - 1) * pref_penalty
+        
+        # Add penalty for assignment rows not summing to 1
+        PC += np.abs(1 - A.sum(axis=1,keepdims=True) ) * pref_penalty / N_DAYS
+        return PC    
+    
     def calc_accounting_cost(self, occupancy):
         """Calculates the accounting cost based on the occupancy on each day.
         Returns an array of length N_DAYS, attributing costs to individual daily occupancies."""
@@ -180,7 +222,6 @@ class AssignmentHelper():
 
         return new_cost - orig_cost            
 
-
     def get_preference_rank_matrix(self):
         """Return a matrix of size (# Families) x (# Days) containing the family's ranked preference for that day.
         """
@@ -192,12 +233,13 @@ class AssignmentHelper():
     def get_preference_cost_matrix(self):
         """Return a matrix of size (# Families) x (# Days) containing the cost of each family being assigned any day.
         """
-        pref_rank = self.get_preference_rank_matrix()
-        pref_costs_lookup_expanded = self.pref_cost_lookup[ self.family_sizes ]
-        row_idx = np.tile( np.arange(N_FAMILIES).reshape(N_FAMILIES,1), N_DAYS )
-        return pref_costs_lookup_expanded[row_idx,pref_rank]        
-    
-    
+        if self.pref_cost_matrix is None:
+            pref_rank = self.get_preference_rank_matrix()
+            pref_costs_lookup_expanded = self.pref_cost_lookup[ self.family_sizes ]
+            row_idx = np.tile( np.arange(N_FAMILIES).reshape(N_FAMILIES,1), N_DAYS )
+            self.pref_cost_matrix = pref_costs_lookup_expanded[row_idx,pref_rank]        
+        return self.pref_cost_matrix
+
     
 class AssignmentManager():
     
@@ -284,4 +326,119 @@ class AssignmentManager():
         score = int(self.get_total_cost())
         curr_date = datetime.datetime.date(datetime.datetime.now())
         new_sub.to_csv( '../assignments/' + f'submission_{score}_{curr_date}.csv')
+        
+        
+
+class ProbAM():
+    """Probabilistic assignment manager. Each assignment is a probability distribution over all days."""
+    
+    def __init__(self):
+
+        self.helper = AssignmentHelper()
+        self.pref_rank_mtx = helper.get_preference_rank_matrix()
+        
+        # Initialize properties that will be set when the initial assignment is provided
+        self.assignment_prob = None
+        self.occupancy_prob = None
+        self.accounting_cost = None
+    
+    def set_assignment(self, assignment_prob):
+        self.assignment_prob = assignment_prob.copy()
+        self.occupancy_prob = ( assignment_prob * helper.family_sizes[:,np.newaxis] ).sum(axis=0)        
+
+        self._accounting_cost = self.get_accounting_cost()
+        self._preference_cost = self.get_preference_cost().sum(axis=1)
+    
+    def get_accounting_cost(self):
+        return self.helper.calc_accounting_cost(self.occupancy_prob )
+                    
+    def get_preference_cost(self, idx=None):
+        return self.helper.calc_preference_cost_prob( self.assignment_prob, idx=idx)
+            
+    def get_total_cost(self):
+        return np.sum( self.get_preference_cost() ) + np.sum( self.get_accounting_cost() )
+    
+    def get_pref_cost_grad(self, family_id=None):
+        if family_id is not None:
+            grads = self.pref_cost_matrix[[family_id],:]
+        else:
+            grads = self.pref_cost_matrix
+            
+        # Adjust the gradients so that each row of the assignment probability sums to 1
+        grads[:-1] = np.hstack( [ grads[:,:-1] - grads[:,-1], \
+                          np.sum( grads[:,-1] - grads[:,:-1], axis=1) ] )
+        
+    def get_acct_cost_grad(self, family_id=None):
+        pass
+
+    def calc_acct_cost_change(self, idx_family, chg_occ ):        
+        curr_acct_cost = self._accounting_cost
+        new_acct_cost = self.helper.calc_accounting_cost( self.occupancy_prob + chg_occ )
+        return new_acct_cost - curr_acct_cost
+        
+    def calc_pref_cost_change(self, idx_family, chg_vec):        
+        A = self.assignment_prob[ [idx_family],:]
+        curr_pref_cost = self.helper.calc_preference_cost_prob( A, idx=idx_family)
+        new_pref_cost = self.helper.calc_preference_cost_prob( A + chg_vec, idx=idx_family)
+        return new_pref_cost.ravel() - curr_pref_cost.ravel()
+        
+    def calc_total_cost_change(self, idx_family, chg_vec):
+        pref_cost_chg = self.calc_pref_cost_change(idx_family, chg_vec)
+        acct_cost_chg = self.calc_acct_cost_change(idx_family, chg_vec)        
+        return pref_cost_chg + acct_cost_chg
+        
+    def _get_change_vector(self, idx_family, idx_day, chg_scale=0.05):
+        chg_vec = np.zeros( (N_DAYS,))
+        chg_vec[idx_day] = chg_scale
+        chg_vec -= chg_vec.mean()
+        
+        # Make sure the resulting assignments will be in [0,1]
+        tot = self.assignment_prob[idx_family,:] + chg_vec
+        tot = np.clip( tot, 1e-10, 1 - 1e-10 )
+        return tot - self.assignment_prob[idx_family,:]
+        
+        return chg_vec
+    
+    def anneal(self, ran_gen, T_init=10, cooling=0.95 ):
+        """Run simulated annealing"""
+
+        T = T_init
+        changes = deque(maxlen=10)
+        last_cost = self.get_total_cost() - 1000
+        ctr = 0
+        while True:
+            if ctr % 1000 == 0:
+                curr_cost = self.get_total_cost()                
+                if ctr > 0:
+                    print( [ ctr, T, curr_cost ] )
+                    T *= cooling
+                    changes.appendleft( curr_cost - last_cost )
+                    if T < T_init/100 and len(changes) >= 10 and np.mean(changes) > -1:
+                        return
+                last_cost = self.get_total_cost()
+
+            # Choose a random family, weighted by how high their preference cost is
+            fam_prob = self._preference_cost / self._preference_cost.sum()
+            idx_family = ran_gen.choice(N_FAMILIES, p=fam_prob)
+
+            # Move some probability mass to a single day. Weight the change by the inverse pref cost matrix
+            adj_pref_costs = pam.helper.get_preference_cost_matrix()[idx_family,:]
+            inv_pref_costs = ( 20 + MAX_PREFERENCE_COST - adj_pref_costs ) ** 2
+            new_day = ran_gen.choice( N_DAYS, p=inv_pref_costs/inv_pref_costs.sum())
+
+            # Get the change vector
+            chg_scale = ran_gen.beta(10,40)
+            chg_prob = self._get_change_vector(idx_family, new_day, chg_scale)
+            chg_occ = chg_prob * self.helper.family_sizes[idx_family]
+
+            # Choose whether or not to accept the change
+            chg_acct_cost = self.calc_acct_cost_change(idx_family, chg_occ )
+            chg_pref_cost = self.calc_pref_cost_change(idx_family, chg_prob )            
+            chg_tot_cost = chg_acct_cost.sum() + chg_pref_cost.sum() 
+            if chg_tot_cost < 0 or np.exp( -chg_tot_cost/T ) > ran_gen.rand():
+                self.assignment_prob[idx_family,:] += chg_prob
+                self.occupancy_prob += chg_occ
+                self._accounting_cost += chg_acct_cost
+                self._preference_cost[idx_family] += chg_pref_cost.sum()       
+            ctr += 1                       
         
